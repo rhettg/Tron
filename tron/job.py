@@ -152,7 +152,12 @@ class Job(object):
 
     def __init__(self, name=None, action=None, context=None):
         self.name = name
-        self.topo_actions = [action] if action else []
+        self.topo_actions = []
+        self.action_registry = dict()
+
+        if action:
+            self.add_action(action)
+
         self.scheduler = None
         self.runs = deque()
         
@@ -176,8 +181,13 @@ class Job(object):
 
     def _register_action(self, action):
         """Prepare an action to be *owned* by this job"""
-        if action in self.topo_actions:
+        if action.name in self.action_registry:
             raise Error("Action %s already in jobs %s" % (action.name, job.name))
+        self.action_registry[action.name] = action
+
+    def reset_actions(self):
+        self.topo_actions = list()
+        self.action_registry = dict()
 
     def add_action(self, action):
         self._register_action(action)

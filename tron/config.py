@@ -108,18 +108,42 @@ def default_or_from_tag(value, cls):
     
 class _ConfiguredObject(yaml.YAMLObject, FromDictBuilderMixin):
     """Base class for common configured objects where the configuration generates one actualized 
-    object in the app that may be referenced by other objects."""
+    object in the app that may be referenced by other objects.
+    
+    The reason for all this actualization stuff is that we have be able to handle reconfigurations.
+    Meaning sometimes we'll be building an object from scratch, sometimes we'll be creating new ones.
+
+    Generally it's up to the caller to find existing instances, as well as do something with actualized object.
+    The general flow would be:
+
+        obj = find_existing()
+        if obj:
+            config_object.update(obj)
+
+        add_new_object(obj.actualized)
+    """
     actual_class = None     # Redefined to indicate the type of object this configuration will build
-
-    def _apply(self):
-        raise NotImplementedError
-
     def update(self, obj):
-        self._ref = weakref.ref(obj)
-        self._apply()
-        
+        """Set and configure the specified existing object"""
+        if self._ref:
+            raise Error("We already think we have the actualized object")
+
+        self.actualized = obj
+        self._apply(obj)
+    
+    def create(self):
+        """Create and configure new instance of the actualized object"""
+        obj = self._build()
+        self._apply(obj)
+        return obj
+
     def _build(self):
+        """Build a new instance of the configured object"""
         return self.actual_class()
+
+    def _apply(self, obj):
+        """Apply configuration to the actualized object"""
+        raise NotImplementedError
 
     def __cmp__(self, other):
         if not isinstance(other, self.__class__):
@@ -129,25 +153,28 @@ class _ConfiguredObject(yaml.YAMLObject, FromDictBuilderMixin):
         other_dict = [(key, value) for key, value in other.__dict__.iteritems() if not key.startswith('_')]
         
         c = cmp(our_dict, other_dict)
-        print c, our_dict, other_dict
         return c
 
     def __hash__(self):
         raise Exception('hashing')
 
-    @property
-    def actualized(self):
+    def _get_actualized(self):
         if not hasattr(self, '_ref'):
-            actualized_obj = self._build()
-            self.update(actualized_obj)
-        else:
-            actualized_obj = self._ref()
+            self._ref = self.create()
 
-        return actualized_obj
+        return self._ref
+
+    def _set_actualized(self, val):
+        self._ref = obj
+
+    actualized = property(_get_actualized, _set_actualized)
 
 
 class TronConfiguration(yaml.YAMLObject):
     yaml_tag = u'!TronConfiguration'
+    def __init__(self, *args, **kwargs):
+        super(TronConfiguration, self).__init__(*args, **kwargs)
+        self.nodes = {}
 
     def _apply_jobs(self, mcp):
         """Configure actions"""
@@ -167,9 +194,15 @@ class TronConfiguration(yaml.YAMLObject):
             jobs.extend([default_or_from_tag(job_val, Service) for job_val in self.services])
 
         found_jobs = reduce(check_dup, jobs, {})
+
+        # HEREIAM: Need to find existing jobs and update them
         for job_config in jobs:
             new_job = job_config.actualized
             log.debug("Building new job %s", job_config.name)
+            
+            # During a reconfig, we are still calling 'add_job' which is going to have intelligence about
+            # how to merge to previous and current version of the job. I think might need a little bit of
+            # refactoring as reconfig logic should really belong to 'config'.
             mcp.add_job(new_job)
 
         for job_name in mcp.jobs.keys():
@@ -203,11 +236,11 @@ class TronConfiguration(yaml.YAMLObject):
 
         if hasattr(self, 'ssh_options'):
             self.ssh_options = default_or_from_tag(self.ssh_options, SSHOptions)
-            self.ssh_options._apply(mcp)
+            self.ssh_options.apply(mcp)
         
         if hasattr(self, 'notification_options'):
             self.notification_options = default_or_from_tag(self.notification_options, NotificationOptions)
-            self.notification_options._apply(mcp)
+            self.notification_options.apply(mcp)
         
 
 class SSHOptions(yaml.YAMLObject, FromDictBuilderMixin):
@@ -239,7 +272,7 @@ class SSHOptions(yaml.YAMLObject, FromDictBuilderMixin):
         
         return ssh_options
         
-    def _apply(self, mcp):
+    def apply(self, mcp):
         options = self._build_conch_options()
 
         for node in mcp.nodes:
@@ -248,7 +281,7 @@ class SSHOptions(yaml.YAMLObject, FromDictBuilderMixin):
 
 class NotificationOptions(yaml.YAMLObject, FromDictBuilderMixin):
     yaml_tag = u'!NotificationOptions'
-    def _apply(self, mcp):
+    def apply(self, mcp):
         if not hasattr(self, 'smtp_host'):
             raise Error("smtp_host required")
         if not hasattr(self, 'notification_addr'):
@@ -263,34 +296,55 @@ class Job(_ConfiguredObject):
     yaml_tag = u'!Job'
     actual_class = job.Job
 
-    def _match_name(self, real, name):
-        real.name = name
-        
-        if not re.match(r'[a-z_]\w*$', name, re.I):
+    def _match_name(self, real_job):
+        if not re.match(r'[a-z_]\w*$', self.name, re.I):
             raise yaml.YAMLError("Invalid job name '%s' - not a valid identifier" % self.name)
+        if real_job.name and real_job.name != self.name:
+            raise Error("Can't change job names !?")
 
-    def _match_schedule(self, real, schedule):
+        real_job.name = self.name
+        
+    def _match_schedule(self, real_job):
+        # Schedulers have no state, so we won't bother trying to preserv any previously configured one
         if isinstance(schedule, basestring):
             # This is a short string
-            real.scheduler = Scheduler.from_string(schedule)
+            real_job.scheduler = Scheduler.from_string(self.schedule)
         else:
             # This is a scheduler instance, which has more info
-            real.scheduler = schedule.actualized
-        real.scheduler.job_setup(real)
+            real_job.scheduler = self.schedule.actualized
 
-    def _match_actions(self, real_job, actions):
-        for action_conf in actions:
-            action = default_or_from_tag(action_conf, Action)
-            real_action = action.actualized
+        real_job.scheduler.job_setup(real_job)
 
-            if not real_job.node_pool and not real_action.node_pool:
-                raise yaml.YAMLError("Either job '%s' or its action '%s' must have a node" 
-                   % (real_job.name, action_action.name))
+    def _match_actions(self, real_job):
+        # Store previous action configuration in case of problems
+        prev_topo_actions = real_job.topo_actions
+        prev_registry = real_job.action_registry
 
-            real_job.add_action(real_action)
-    
-    def _match_node(self, real_job, node_conf):
-        node = default_or_from_tag(node_conf, Node)
+        try:
+            real_job.reset_actions()
+            
+            for action_conf in self.actions:
+                action = default_or_from_tag(action_conf, Action)
+
+                # Let's see if we can find this existing action
+                prev_action = prev_registry.get(action.name)
+                if prev_action:
+                    action.update(prev_action)
+
+                real_action = action.actualized
+                if not real_job.node_pool and not real_action.node_pool:
+                    raise yaml.YAMLError("Either job '%s' or its action '%s' must have a node" 
+                       % (real_job.name, action_action.name))
+
+                real_job.add_action(real_action)
+        except Exception:
+            # Restore previous action config
+            real_job.topo_actions = prev_topo_actions
+            real_job.action_registry = prev_registry
+            raise
+
+    def _match_node(self, real_job):
+        node = default_or_from_tag(self.node, Node)
         if not isinstance(node, NodePool):
             node_pool = NodePool()
             node_pool.nodes.append(node)
@@ -299,13 +353,11 @@ class Job(_ConfiguredObject):
             
         real_job.node_pool = node_pool.actualized
                     
-    def _apply(self):
-        real_job = self._ref()
-
-        self._match_name(real_job, self.name)
-        self._match_node(real_job, self.node)
-        self._match_schedule(real_job, self.schedule)
-        self._match_actions(real_job, self.actions)
+    def _apply(self, real_job):
+        self._match_name(real_job)
+        self._match_node(real_job)
+        self._match_schedule(real_job)
+        self._match_actions(real_job)
 
         if hasattr(self, "queueing"):
             real_job.queueing = self.queueing
@@ -321,24 +373,35 @@ class Service(Job):
     yaml_tag = u'!Service'
     actual_class = job.Job
 
-    def _apply(self):
-        real_service = self._ref()
+    def _apply(self, real_service):
+        self.schedule = self.monitor['schedule']
+        self.actions = self.monitor['actions']
 
-        self._match_name(real_service, self.name)
-        self._match_node(real_service, self.node)
-        self._match_schedule(real_service, self.monitor['schedule'])
-        self._match_actions(real_service, self.monitor['actions'])
+        self._match_name(real_service)
+        self._match_node(real_service)
+        self._match_schedule(real_service)
+        self._match_actions(real_service)
 
         if hasattr(self, "enable"):
             enable = default_or_from_tag(self.enable, Action)
             enable.name = enable.name or "enable"
-            real_service.set_enable_action(enable.actualized)
-        
+            if real_service.enable_act:
+                enable.update(real_service.enable_act)
+            else:
+                real_service.set_enable_action(enable.actualized)
+        else:
+            real_service.enable_act = None
+            
         if hasattr(self, "disable"):
             disable = default_or_from_tag(self.disable, Action)
             disable.name = disable.name or "disable"
-            real_service.set_disable_action(disable.actualized)
-
+            
+            if real_service.disable_act:
+                disable.update(real_service.disable_act)
+            else:
+                real_service.set_disable_action(disable.actualized)
+        else:
+            real_service.disable_act = None
 
 class Action(_ConfiguredObject):
     yaml_tag = u'!Action'
@@ -357,16 +420,21 @@ class Action(_ConfiguredObject):
         for req in requirements:
             real_action.required_actions.append(req.actualized)
 
-    def _apply(self):
+    def _apply(self, real_action):
         """Configured the specific action instance"""
-        real_action = self._ref()
         if not re.match(r'[a-z_]\w*$', self.name, re.I):
             raise yaml.YAMLError("Invalid action name '%s' - not a valid identifier" % self.name)
 
         real_action.name = self.name
+        if real_action.name != self.name:
+            raise Error("Can't change name of an action")
+
         real_action.command = self.command
+
         if hasattr(self, "node"):
+            # TODO: This node matching code is going to be the same as for a job, figure out how to refactor
             node = default_or_from_tag(self.node, Node)
+            
             if not isinstance(node, NodePool):
                 node_pool = NodePool()
                 node_pool.nodes.append(node)
@@ -374,29 +442,41 @@ class Action(_ConfiguredObject):
                 node_pool = node
                 
             real_action.node_pool = node_pool.actualized
-
+        else:
+            real_action.node_pool = None
+        
         if hasattr(self, "requires"):
             self._apply_requirements(real_action, self.requires)
-
+        else:
+            real_action.required_actions = None
 
 class NodePool(_ConfiguredObject):
     yaml_tag = u'!NodePool'
     actual_class = node.NodePool
-    def __init__(self, *args, **kwargs):
-        super(NodePool, self).__init__(*args, **kwargs)
-        self.nodes = []
-    def _apply(self):
-        real_node_pool = self._ref()
-        for node in self.nodes:
-            real_node_pool.nodes.append(default_or_from_tag(node, Node).actualized)
-        
+
+    def _apply(self, real_node_pool):
+        existing_nodes = getattr(real_node_pool, "nodes", [])
+        try:
+
+            real_node_pool.nodes = []
+            for node in self.nodes:
+                # All these nodes should already be created, so we don't need to update with the
+                # real versions here
+                real_node = default_or_from_tag(node, Node).actualized
+                real_node_pool.nodes.append(real_node)
+
+        except Exception:
+            real_node_pool.nodes = existing_nodes
+            raise
         
 class Node(_ConfiguredObject):
     yaml_tag = u'!Node'
     actual_class = node.Node
     
-    def _apply(self):
-        real_node = self._ref()
+    def _apply(self, real_node):
+        if real_node.hostname and real_node.hostname != self.hostname:
+            raise Error("Can't change hostname !?")
+
         real_node.hostname = self.hostname
 
 
@@ -461,9 +541,7 @@ class IntervalScheduler(_ConfiguredObject):
 
         super(IntervalScheduler, self).__init__(*args, **kwargs)
 
-    def _apply(self):
-        sched = self._ref()
-        
+    def _apply(self, sched):
         # Now let's figure out the interval
         if self.interval in TIME_INTERVAL_SHORTCUTS:
             kwargs = TIME_INTERVAL_SHORTCUTS[self.interval]
@@ -501,9 +579,7 @@ class DailyScheduler(_ConfiguredObject):
 
         super(DailyScheduler, self).__init__(*args, **kwargs)
 
-    def _apply(self):
-        sched = self._ref()
-
+    def _apply(self, sched):
         if hasattr(self, 'start_time'):
             if not isinstance(self.start_time, basestring):
                 raise ConfigError("Start time must be in string format HH:MM:SS")
@@ -514,6 +590,7 @@ class DailyScheduler(_ConfiguredObject):
         if hasattr(self, 'days'):
             sched.wait_days = sched.get_daily_waits(self.days)
 
+
 def load_config(config_file):
     """docstring for load_config"""
     config = yaml.load(config_file)
@@ -521,7 +598,6 @@ def load_config(config_file):
         raise ConfigError("Failed to find a configuration document in specified file")
     
     return config
-
 
 def configure_daemon(path, daemon):
     config = load_config(path)
